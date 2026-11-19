@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import logging
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+
+from src.api.schemas import UploadBatchResponse, UploadItemResponse, UploadResponse
+
+router = APIRouter(tags=["upload"])
+logger = logging.getLogger(__name__)
+
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".text"}
+
+
+def _strict_scope_enabled() -> bool:
+    return os.getenv("REQUIRE_CHAT_SCOPE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _safe_contract_stem(filename: str | None, fallback: str) -> str:
+    stem = Path(filename or fallback).stem
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+    return cleaned or fallback
+
+@router.post("/upload", response_model=UploadResponse | UploadBatchResponse)
+async def upload_contract(
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] | None = File(default=None),
+    chat_id: str | None = Form(default=None),
+) -> UploadResponse | UploadBatchResponse:
+
+    upload_items: list[UploadFile] = []
+    if file is not None:
+        upload_items.append(file)
+    if files:
+        upload_items.extend(files)
+
+    if not upload_items:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
+
+    pipeline = getattr(request.app.state, "pipeline", None)
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline is not initialized.")
+
+    chat_scope_registry = getattr(request.app.state, "chat_scope_registry", None)
+    if chat_scope_registry is None:
+        raise HTTPException(status_code=503, detail="Chat scope registry is not initialized.")
+
+    strict_scope = _strict_scope_enabled()
+    if strict_scope and not str(chat_id or "").strip():
+        raise HTTPException(status_code=400, detail="chat_id is required by server policy.")
+
+    resolved_chat_id = str(chat_id or "").strip() or str(uuid.uuid4())
+
+    upload_results: list[UploadItemResponse] = []
+
+    for index, upload in enumerate(upload_items, start=1):
+        if upload.filename:
+            ext = Path(upload.filename).suffix.lower()
+            if ext and ext not in ALLOWED_EXTENSIONS:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+                )
+
+        file_bytes = bytearray()
+        CHUNK_SIZE = 1024 * 1024
+        MAX_SIZE = 10 * 1024 * 1024
+
+        while chunk := await upload.read(CHUNK_SIZE):
+            file_bytes.extend(chunk)
+            if len(file_bytes) > MAX_SIZE:
+                raise HTTPException(status_code=413, detail=f"File too large: {upload.filename}")
+
+        file_bytes = bytes(file_bytes)
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Uploaded file is empty: {upload.filename or f'file_{index}'}",
+            )
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        base_name = _safe_contract_stem(upload.filename, f"contract_{index}")
+        contract_id = f"{base_name}_{timestamp}"
+
+        try:
+            pipeline_result = await run_in_threadpool(
+                pipeline.ingest_upload,
+                upload.filename or "contract.txt",
+                file_bytes,
+                contract_id,
+            )
+        except Exception as error:
+            logger.exception(
+                "Pipeline ingestion failed",
+                extra={"source_filename": upload.filename or contract_id},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Pipeline ingestion failed for {upload.filename or contract_id}.",
+            ) from error
+
+        upload_results.append(
+            UploadItemResponse(
+                contract_id=str(pipeline_result.get("contract_id", contract_id)),
+                source_name=upload.filename or f"contract_{index}",
+                chunks_ingested=int(pipeline_result.get("chunks_ingested", 0)),
+                message=str(pipeline_result.get("message", "Contract uploaded and indexed successfully.")),
+            )
+        )
+
+    await run_in_threadpool(
+        chat_scope_registry.add_contracts,
+        resolved_chat_id,
+        [item.contract_id for item in upload_results],
+    )
+
+    if len(upload_results) == 1:
+        single = upload_results[0]
+        return UploadResponse(
+            chat_id=resolved_chat_id,
+            contract_id=single.contract_id,
+            chunks_ingested=single.chunks_ingested,
+            message=single.message,
+        )
+
+    return UploadBatchResponse(
+        chat_id=resolved_chat_id,
+        uploads=upload_results,
+        total_files=len(upload_results),
+        message=f"Indexed {len(upload_results)} files using the unified Chroma pipeline.",
+    )
